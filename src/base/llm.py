@@ -159,14 +159,24 @@ class LLMManager:
 
         return results_list
 
-
     async def extract_entities(self, text: str, session_time: str = "") -> List[Dict[str, Any]]:
         prompt = QUERY_ENTITY_EXTRACTION_PROMPT.format(text=text, session_time=session_time)
-        logger.info(f"Sending professional entity extraction prompt to LLM (model: {self.model}, session_time: {session_time})")
+        logger.info(
+            f"Sending professional entity extraction prompt to LLM "
+            f"(model: {self.model}, session_time: {session_time})"
+        )
 
         entities = await self.generate(prompt, task="entities_extraction")
-        logger.info(f"Successfully extracted {len(entities)} entities")
-        return entities
+        parsed_entities = []
+
+        for entity in entities:
+            parsed_entities.append({
+                "entity": entity["entity_name"],
+                "type": entity["entity_type"]
+            })
+
+        logger.info(f"Successfully extracted {len(parsed_entities)} entities")
+        return parsed_entities
 
     async def batch_extract_entities(self, texts: List[str], progress_bar=None) -> List[List[Dict[str, Any]]]:
         if not self.enable_concurrent:

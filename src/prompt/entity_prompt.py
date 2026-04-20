@@ -143,7 +143,6 @@ For each pair of related entities, extract the following information:
 - target_entity: name of the target entity, as identified in step 1
 - relationship_name: how the source entity and the target entity are related to each other
 - relationship_strength: a numeric score indicating strength of the relationship between the source entity and target entity from 1 and 10. User related relationships should have a higher strength.
-Format each relationship as <create_time> - <session_id> - <source_entity> - <target_entity> - <relationship_name> - <relationship_strength>
 
 3. Return output in English as two lists of all the entities and relationships identified in steps 1 and 2. One list contains the entities, the other contains the relationships.
 

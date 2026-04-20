@@ -155,8 +155,10 @@ class PPRRetriever:
         self,
         local_graph: nx.MultiDiGraph,
         seed_triples: List[Dict[str, Any]],
+        symbolic_anchor_bonus: Optional[Dict[str, float]] = None,
     ) -> Dict[str, float]:
         node_to_scores: Dict[str, List[float]] = defaultdict(list)
+        symbolic_anchor_bonus = symbolic_anchor_bonus or {}
 
         for triple in seed_triples:
             similarity_score = self._get_similarity_score(triple)
@@ -171,8 +173,10 @@ class PPRRetriever:
         for node in local_graph.nodes():
             scores = node_to_scores.get(node, [])
             average_score = sum(scores) / len(scores) if scores else 0.0
+            anchor_bonus = float(symbolic_anchor_bonus.get(node, 0.0))
             local_graph.nodes[node]["seed_score"] = average_score
-            personalization[node] = average_score
+            local_graph.nodes[node]["symbolic_anchor_bonus"] = anchor_bonus
+            personalization[node] = average_score + anchor_bonus
 
         total = sum(personalization.values())
         if total <= 0:
@@ -188,6 +192,62 @@ class PPRRetriever:
             personalization[node] = normalized_score
 
         return personalization
+
+    async def symbolic_anchoring(
+        self,
+        local_graph: nx.MultiDiGraph,
+        entities: List[str],
+    ) -> Dict[str, float]:
+        if local_graph.number_of_nodes() == 0 or not entities:
+            return {}
+
+        normalized_entities = [entity.strip() for entity in entities if isinstance(entity, str) and entity.strip()]
+        if not normalized_entities:
+            return {}
+
+        node_names: List[str] = []
+        node_embeddings: List[List[float]] = []
+        for node_name, node_data in local_graph.nodes(data=True):
+            embedding = node_data.get("embedding")
+            if embedding is None:
+                continue
+            node_names.append(node_name)
+            node_embeddings.append(embedding)
+
+        if not node_embeddings:
+            logger.warning("Skipping symbolic anchoring because local graph nodes have no embeddings")
+            return {}
+
+        entity_embeddings = await self.embedding_manager.get_embeddings(normalized_entities)
+        if not entity_embeddings or len(entity_embeddings) != len(normalized_entities):
+            logger.warning("Skipping symbolic anchoring because entity embeddings could not be computed")
+            return {}
+
+        anchor_bonus: Dict[str, float] = defaultdict(float)
+        anchor_entities: Dict[str, List[str]] = defaultdict(list)
+
+        for entity, entity_embedding in zip(normalized_entities, entity_embeddings):
+            similarities = self.embedding_manager.batch_cosine_similarity(entity_embedding, node_embeddings)
+            if not similarities:
+                continue
+
+            best_index = max(range(len(similarities)), key=lambda index: similarities[index])
+            best_node = node_names[best_index]
+
+            anchor_bonus[best_node] += 0.2
+            anchor_entities[best_node].append(entity)
+
+        for node_name in local_graph.nodes():
+            local_graph.nodes[node_name]["symbolic_anchor_bonus"] = float(anchor_bonus.get(node_name, 0.0))
+            if node_name in anchor_entities:
+                local_graph.nodes[node_name]["anchored_entities"] = anchor_entities[node_name]
+
+        logger.info(
+            "Applied symbolic anchoring for %s entities across %s nodes",
+            len(normalized_entities),
+            len(anchor_bonus),
+        )
+        return dict(anchor_bonus)
 
     def run_ppr(
         self,
@@ -227,7 +287,10 @@ class PPRRetriever:
 
             src_score = float(local_graph.nodes[src].get("ppr_score", 0.0))
             tgt_score = float(local_graph.nodes[tgt].get("ppr_score", 0.0))
-            triple_score = min(src_score, tgt_score)
+            if src_score + tgt_score > 0:
+                triple_score = 2 * src_score * tgt_score / (src_score + tgt_score)
+            else:
+                triple_score = 0.0
 
             ranked_triple = data.get("triple", {}).copy()
             ranked_triple["ppr_score"] = triple_score
@@ -244,7 +307,8 @@ class PPRRetriever:
     async def retrieve(
         self,
         question: str,
-        candidate_sessions: List[str]
+        candidate_sessions: List[str],
+        entities: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
 
         local_triples = self.sessions_to_triples(candidate_sessions)
@@ -263,15 +327,17 @@ class PPRRetriever:
             }
 
         local_graph = self.build_local_graph(local_triples)
-        personalization = self.assign_reset_probabilities(local_graph, seed_triples)
+        symbolic_anchor_bonus = await self.symbolic_anchoring(local_graph, entities or [])
+        personalization = self.assign_reset_probabilities(local_graph, seed_triples, symbolic_anchor_bonus)
         node_scores = self.run_ppr(local_graph, personalization)
 
-        top_k = getattr(self.config.retriever, "top_k_triples", 10)
+        top_k = 15
         reranked_triples = self.rank_triples_from_ppr(local_graph, top_k=top_k)
 
         return {
             "seed_triples": seed_triples,
             "local_graph": local_graph,
+            "symbolic_anchor_bonus": symbolic_anchor_bonus,
             "node_scores": node_scores,
             "reranked_triples": reranked_triples,
         }

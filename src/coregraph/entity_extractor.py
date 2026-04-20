@@ -71,6 +71,7 @@ class EntityExtractor:
         unique_entities = []
         for entity in entities:
             entity_name = entity.get("entity", "").lower()
+            print(f"Entity name: {entity_name}")
             is_duplicate = False
 
             for unique_entity in unique_entities:

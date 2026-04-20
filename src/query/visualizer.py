@@ -1,7 +1,4 @@
-import sys
 import os
-
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import networkx as nx
 import matplotlib.pyplot as plt
@@ -10,7 +7,7 @@ from matplotlib.patches import FancyBboxPatch
 import numpy as np
 from typing import List, Dict, Any, Tuple
 import pandas as pd
-from init.logger import logger
+from src.init.logger import logger
 
 plt.rcParams['font.family'] = ['Liberation Serif', 'DejaVu Serif', 'serif']
 plt.rcParams['font.size'] = 10

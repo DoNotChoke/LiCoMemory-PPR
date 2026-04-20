@@ -1,8 +1,8 @@
 index_name:
-data_type: LOCOMO  # Dataset type: "LongmemEval" or "LOCOMO"
-data_root: src/dataset/locomo
-dataset_name: LOCOMO
-working_dir: /your/workingdirectory
+data_type: LongmemEval  # Dataset type: "LongmemEval" or "LOCOMO"
+data_root: src/dataset/longmemeval
+dataset_name: LongmemEval
+working_dir: results/locomo/group_3/visualizations
 ################################# Embedding #################################
 embedding:
   api_type: "hf"
@@ -48,30 +48,25 @@ dialog:
 ################################# Graph #################################
 graph:
   graph_type: dynamic_memory
-  force: True
+  force: False
   add: False
   entity_merge_threshold: 0.85
   relationship_merge_threshold: 1
 ################################# Retriever #################################
 retriever:
   top_k: 5
-  top_k_triples: 20
+  top_k_triples: 15
   top_chunks: 15
   enable_summary: True
   top_summary: 3
-  enable_visual: False
+  enable_visual: True
   top_visual: 15
   enable_full: True
   enable_sessiontime: True
   enable_CogniRank: True
   summary_weight: 0.25
   rerank_k: 0.1
-  enable_ppr_query: True
-  ppr_weight: 0.35
-  ppr_alpha: 0.5
-  ppr_top_sessions: 3
-  ppr_top_triples: 60
-  ppr_top_seed_phrases: 8
+
 ################################# Evaluation #################################
 evaluation:
   enable_llm_eval: True

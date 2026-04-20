@@ -2,6 +2,7 @@ from typing import List, Dict, Any, Tuple
 import os
 import time
 
+from src.query.query_to_triple import QueryToTriple
 from src.init.logger import logger
 from src.init.config import Config
 from src.base.llm import LLMManager
@@ -12,6 +13,7 @@ from src.utils.cost_manager import QueryCostManager
 from src.query.summary_retriever import SummaryRetriever
 from src.query.visualizer import QueryResultVisualizer
 from src.query.triple_reranker import TripleReranker
+from src.query.ppr_engine import PPREngine
 
 class QueryProcessor:
 
@@ -49,10 +51,11 @@ class QueryProcessor:
         if hasattr(config.retriever, "enable_visual") and config.retriever.enable_visual:
             self.visualizer = QueryResultVisualizer(config)
 
-        self.ppr_retriever = None
-
         self.triple_reranker = TripleReranker(config)
 
+        self.ppr_engine = PPREngine(config, self.embedding_manager)
+        logger.info("PPR pipeline enabled")
+        self.query_to_triple = QueryToTriple(config, dynamic_memory, self.embedding_manager)
         self.time_manager = QueryTimeStatistic()
         self.cost_manager = QueryCostManager(max_budget=llm_manager.cost_manager.max_budget)
 
@@ -88,68 +91,117 @@ class QueryProcessor:
         return await self._process_unified_query(question, question_time=question_time)
 
     async def _process_unified_query(self, question: str, question_time: str = "") -> Dict[str, Any]:
-        self.time_manager.start_entity_extraction()
         self.time_manager.start_retrieval()
+        cost_before_retrieval = self.llm.cost_manager.get_costs()
+
+        graph = (
+            self.dynamic_memory.graph_builder.graph
+            if self.dynamic_memory and hasattr(self.dynamic_memory, 'graph_builder')
+            else None
+        )
+
+        # ================================================================
+        # Step 1: Entity extraction (reuse existing — feeds symbolic anchors)
+        # ================================================================
+        self.time_manager.start_entity_extraction()
         entities = await self._extract_query_entities(question, question_time)
         self.time_manager.end_entity_extraction()
 
-        cost_before_retrieval = self.llm.cost_manager.get_costs()
-        self.time_manager.start_similar_entity_search()
-        entities_with_types = await self._prepare_entities_with_types_from_extracted(entities)
-        relevant_entities = await self._find_similar_entities(question, entities_with_types)
-        self.time_manager.end_similar_entity_search()
-
-        self.time_manager.start_triple_retrieval()
-        relevant_triples = await self._get_relevant_triples(question, relevant_entities)
-        self.time_manager.end_triple_retrieval()
-
+        # ================================================================
+        # Step 2: Channel A — summary-based session retrieval
+        # ================================================================
         self.time_manager.start_summary_retrieval()
+        summary_rankings = {}
+        relevant_summaries = []
 
-        if (self.summary_retriever and
-                hasattr(self.config.retriever, 'enable_summary') and
-                self.config.retriever.enable_summary):
-
-            if not self.summary_retriever.summaries or self.summary_retriever.summary_embeddings is None:
-                if not await self.initialize_summary_data():
-                    summary_rankings = {}
-                    relevant_summaries = []
-                else:
-                    summary_rankings, relevant_summaries = await self._calculate_all_summary_scores(question, entities)
-            else:
-                summary_rankings, relevant_summaries = await self._calculate_all_summary_scores(question, entities)
-        else:
-            summary_rankings = {}
-            relevant_summaries = []
+        if (self.summary_retriever
+                and hasattr(self.config.retriever, 'enable_summary')
+                and self.config.retriever.enable_summary):
+            if (not self.summary_retriever.summaries
+                    or self.summary_retriever.summary_embeddings is None):
+                await self.initialize_summary_data()
+            if self.summary_retriever.summaries:
+                summary_rankings, relevant_summaries = (
+                    await self._calculate_all_summary_scores(question, entities)
+                )
         self.time_manager.end_summary_retrieval()
 
+        # ================================================================
+        # Step 3: Channel B — query-to-triple session retrieval
+        # ================================================================
+        self.time_manager.start_triple_retrieval()
+        channel_b = await self.ppr_engine.query_to_triple_retrieval(
+            question, graph
+        )
         self.time_manager.end_triple_retrieval()
 
-        self.time_manager.start_triple_reranking()
-        if relevant_triples:
-            if summary_rankings:
-                sorted_ranks = sorted(summary_rankings.items(), key=lambda x: x[1], reverse=True)
+        # ================================================================
+        # Step 4: Dual-channel fusion → select top-K sessions
+        # ================================================================
+        self.time_manager.start_similar_entity_search()  # reuse timer slot
+        fusion_result = self.ppr_engine.dual_channel_session_selection(
+            summary_rankings, channel_b
+        )
+        selected_sessions = fusion_result['selected_sessions']
+        selected_ids = [s['session_id'] for s in selected_sessions]
+        self.time_manager.end_similar_entity_search()
 
-            reranked_triples = self.triple_reranker.rerank_triples(
-                relevant_triples,
-                relevant_summaries,
-                summary_rankings,
-                question_time=question_time,
-            )
+        # ================================================================
+        # Step 5: Build local subgraph from selected sessions
+        # ================================================================
+        self.time_manager.start_triple_reranking()  # reuse timer slot
+        local_graph = await self.ppr_engine.build_local_graph(
+            selected_ids, graph
+        )
 
-            top_triples = self.triple_reranker.get_top_k_triples(reranked_triples)
-        else:
-            top_triples = []
+        # ================================================================
+        # Step 6: Context-aware PPR → ranked sessions + ranked triples
+        # ================================================================
+        ppr_result = await self.ppr_engine.run_context_aware_ppr(
+            local_graph=local_graph,
+            question=question,
+            query_entities=entities,
+            question_time=question_time,
+            fusion_result=fusion_result,
+            channel_b_triples=channel_b.get('triple_scores', []),
+        )
+        ranked_sessions = ppr_result['ranked_sessions']
+        ranked_triples = ppr_result['ranked_triples']
 
+        # Cut triples to top_k
+        top_k_triples = getattr(self.config.retriever, 'top_k_triples', 20)
+        top_triples = ranked_triples[:top_k_triples]
         self.time_manager.end_triple_reranking()
 
+        # ================================================================
+        # Step 7: Update relevant_summaries from PPR session ranking
+        # ================================================================
+        top_summary_k = getattr(self.config.retriever, 'top_summary', 2)
+        top_session_ids = [s['session_id'] for s in ranked_sessions[:top_summary_k]]
+
+        if self.summary_retriever and self.summary_retriever.summaries:
+            relevant_summaries = [
+                s for s in self.summary_retriever.summaries
+                if s.get('session_id') in top_session_ids
+            ]
+
+        # ================================================================
+        # Step 8: Retrieve dialogue chunks for top triples
+        # ================================================================
         self.time_manager.start_chunk_retrieval()
-        relevant_chunks = await self._get_chunks_for_triples(top_triples)
+        relevant_chunks = await self._get_chunks_for_triples(ranked_triples)
         self.time_manager.end_chunk_retrieval()
 
+        # ================================================================
+        # Step 9: Create prompt + generate answer
+        # ================================================================
         formatted_prompt = await self._create_unified_prompt(
-            question, top_triples, relevant_chunks, relevant_summaries, question_time=question_time
+            question, top_triples, relevant_chunks, relevant_summaries,
+            question_time=question_time,
         )
+
         print(formatted_prompt)
+
         cost_after_retrieval = self.llm.cost_manager.get_costs()
         retrieval_prompt_tokens = cost_after_retrieval.total_prompt_tokens - cost_before_retrieval.total_prompt_tokens
         retrieval_completion_tokens = cost_after_retrieval.total_completion_tokens - cost_before_retrieval.total_completion_tokens
@@ -168,52 +220,53 @@ class QueryProcessor:
         self.cost_manager.update_answer_generation_cost(answer_prompt_tokens, answer_completion_tokens, self.llm.model)
         self.time_manager.end_answer_generation()
 
+        # ================================================================
+        # Step 10: Assemble result
+        # ================================================================
         time_summary = self.time_manager.get_query_summary()
-        cost_summary = self.cost_manager.get_query_summary() if hasattr(self.cost_manager, 'get_query_summary') else {}
+        cost_summary = (
+            self.cost_manager.get_query_summary()
+            if hasattr(self.cost_manager, 'get_query_summary') else {}
+        )
 
-        top_session_ids = []
-        seen_session_ids = set()
-
-        for triple in top_triples:
-            session_id = str(triple.get("session_id", "")).strip()
-            if session_id and session_id not in seen_session_ids:
-                top_session_ids.append(session_id)
-                seen_session_ids.add(session_id)
-
-        if not top_session_ids:
-            for summary in relevant_summaries:
-                session_id = str(summary.get("session_id", "")).strip()
-                if session_id and session_id not in seen_session_ids:
-                    top_session_ids.append(session_id)
-                    seen_session_ids.add(session_id)
+        # Collect top session IDs for evaluation (session matching)
+        top_session_ids_for_eval = [s['session_id'] for s in ranked_sessions]
 
         result = {
-            "question": question,
-            "entities": entities,
-            "relevant_entities": relevant_entities,
-            "triples": top_triples,
-            "chunks": relevant_chunks,
-            "summaries": relevant_summaries,
-            "top_session_ids": top_session_ids[:15],
-            "formatted_prompt": formatted_prompt,
-            "answer": answer,
-            "query_summary": time_summary,
-            "cost_summary": cost_summary
+            'question': question,
+            'entities': entities,
+            'triples': top_triples,
+            'chunks': relevant_chunks,
+            'summaries': relevant_summaries,
+            'formatted_prompt': formatted_prompt,
+            'answer': answer,
+            'top_session_ids': [tri["session_id"] for tri in top_triples[:15]],
+            'ppr_sessions': ranked_sessions[:10],
+            'fusion_sessions': [
+                {'session_id': s['session_id'],
+                 'fusion_score': s['fusion_score'],
+                 'source': s['source']}
+                for s in selected_sessions[:10]
+            ],
+            'query_summary': time_summary,
+            'cost_summary': cost_summary,
         }
 
-        if self.visualizer and hasattr(self.config.retriever, 'enable_visual') and self.config.retriever.enable_visual:
+        if (self.visualizer
+                and hasattr(self.config.retriever, 'enable_visual')
+                and self.config.retriever.enable_visual):
             try:
                 if top_triples:
-                    visualization_path = self.visualizer.create_visualization(question, top_triples)
+                    visualization_path = self.visualizer.create_visualization(
+                        question, top_triples
+                    )
                     if visualization_path:
                         result['visualization_path'] = visualization_path
-                        logger.info(f"📊 Visualization created: {visualization_path}")
             except Exception as e:
                 logger.error(f"Failed to create visualization: {e}")
 
-        logger.info(f"✅ Unified query processing completed for: {question[:70]}...")
+        logger.info(f"✅ PPR query processing completed for: {question[:70]}...")
         return result
-
 
     async def _prepare_entities_with_types_from_extracted(self, entities: List[str]) -> List[Dict[str, str]]:
         entities_with_types = []
@@ -630,93 +683,49 @@ class QueryProcessor:
                 logger.warning("No summaries available")
                 return {}, []
 
-            query_entities = entities or []
-            if not query_entities:
-                import re
-                words = re.findall(r'\b\w+\b', question.lower())
-                query_entities = [word for word in words if len(word) > 2]
+            if not self.summary_retriever.summary_embeddings:
+                logger.warning("Summary embeddings unavailable")
+                return {}, []
 
-            unique_texts = set()
-            text_to_sessions = {}
+            question_embedding = await self.summary_retriever.embedding_manager.get_embeddings(
+                [question],
+                need_tensor=True,
+            )
+            if question_embedding is None or len(question_embedding) != 1:
+                logger.warning("Failed to build question embedding for summary scoring")
+                return {}, []
 
-            for query_entity in query_entities:
-                unique_texts.add(query_entity.lower().strip())
+            summary_embeddings = self.summary_retriever.embedding_manager.transfer_to_tensor(
+                self.summary_retriever.summary_embeddings
+            )
+            similarity_matrix = self.summary_retriever.embedding_manager.cosine_similarity_tensor(
+                question_embedding,
+                summary_embeddings,
+            )
+            similarity_scores = similarity_matrix[0].tolist()
 
-            for summary in all_summaries:
-                session_id = summary.get("session_id", "")
+            ranked_summaries: List[Tuple[Dict[str, Any], float]] = []
+            all_summary_rankings: Dict[str, float] = {}
+            for summary, score in zip(all_summaries, similarity_scores):
+                session_id = str(summary.get("session_id", "")).strip()
                 if not session_id:
                     continue
 
-                summary_keys = []
-                keys_str = summary.get("keys", "")
-                if keys_str and isinstance(keys_str, str):
-                    summary_keys = [key.strip().lower() for key in keys_str.split(",")]
+                similarity = float(score)
+                all_summary_rankings[session_id] = similarity
+                ranked_summaries.append((summary, similarity))
 
-                if not summary_keys:
-                    continue
-
-                for summary_key in summary_keys:
-                    unique_texts.add(summary_key)
-                    if summary_key not in text_to_sessions:
-                        text_to_sessions[summary_key] = []
-                    text_to_sessions[summary_key].append(session_id)
-
-            unique_texts_list = list(unique_texts)
-            logger.info(f"🚀 Batch calculating embeddings for {len(unique_texts_list)} unique texts")
-            all_embeddings = await self.summary_retriever.embedding_manager.get_embeddings(unique_texts_list)
-
-            text_embeddings = {}
-
-            for i, text in enumerate(unique_texts_list):
-                text_embeddings[text] = all_embeddings[i]
-
-            all_summary_rankings = {}
-
-            for summary in all_summaries:
-                session_id = summary.get("session_id", "")
-                if not session_id:
-                    continue
-
-                summary_keys = []
-                keys_str = summary.get("keys", "")
-                if keys_str and isinstance(keys_str, str):
-                    summary_keys = [key.strip().lower() for key in keys_str.split(",") if key.strip()]
-
-                if not summary_keys:
-                    all_summary_rankings[session_id] = 0.0
-                    continue
-
-                all_similarities = []
-                for query_entity in query_entities:
-                    query_entity_clean = query_entity.lower().strip()
-                    query_embedding = text_embeddings.get(query_entity_clean)
-
-                    if query_embedding is None:
-                        continue
-
-                    for summary_key in summary_keys:
-                        summary_embedding = text_embeddings.get(summary_key)
-                        if summary_embedding is None:
-                            continue
-
-                        similarity = self.summary_retriever.embedding_manager.cosine_similarity(query_embedding, summary_embedding)
-                        all_similarities.append(similarity)
-                        logger.debug(f"   📊 '{query_entity_clean}' <-> '{summary_key}': {similarity:.4f}")
-
-                all_similarities.sort(reverse=True)
-                top_3_similarities = all_similarities[:3]
-                avg_similarity = sum(top_3_similarities) / len(top_3_similarities) if top_3_similarities else 0.0
-                all_summary_rankings[session_id] = avg_similarity
-
-            sorted_rankings = sorted(all_summary_rankings.items(), key=lambda x: x[1], reverse=True)
+            ranked_summaries.sort(key=lambda item: item[1], reverse=True)
+            sorted_rankings = [
+                (str(summary.get("session_id", "")).strip(), score)
+                for summary, score in ranked_summaries
+            ]
 
             top_k = getattr(self.config.retriever, "top_summary", 2) if hasattr(self.config, "retriever") else 2
+            relevant_summaries = [summary for summary, _ in ranked_summaries[:top_k]]
 
-            top_session_ids = [session_id for session_id, _ in sorted_rankings[:top_k]]
-            relevant_summaries = [summary for summary in all_summaries if summary.get("session_id") in top_session_ids]
-
-            logger.info(f"✅ Selected top {len(relevant_summaries)} summaries from {len(all_summaries)} total")
-            logger.info(f"📊 All summary rankings: {dict(sorted_rankings[:5])}")
+            logger.info(f"Selected top {len(relevant_summaries)} summaries from {len(all_summaries)} total")
+            logger.info(f"Top summary rankings: {dict(sorted_rankings[:5])}")
 
             return all_summary_rankings, relevant_summaries
 

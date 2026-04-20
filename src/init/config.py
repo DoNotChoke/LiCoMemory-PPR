@@ -1,6 +1,6 @@
 import yaml
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 from dataclasses import dataclass, field
 from .logger import logger
 
@@ -41,7 +41,7 @@ class RetrieverConfig:
     enable_local: bool = False
     use_entity_similarity_for_ppr: bool = False
     node_specificity: bool = True
-    damping: float = 0.1
+    damping: float = 0.8
     top_k: int = 8
     top_k_triples: int = 8
     top_chunks: int = 3                   # Number of top chunks to retrieve based on triple ranking
@@ -55,13 +55,7 @@ class RetrieverConfig:
     enable_sessiontime: bool = False      # If true, prepend session_time to chunk content in prompt
     enable_CogniRank: bool = False        # Enable CogniRank (hierarchical temporal-semantic) vs SimpleRank (weighted)
     rerank_k: float = 0.5                 # Temporal decay exponent for CogniRank (0 < k < 1)
-    enable_ppr_query: bool = True
-    ppr_weight: float = 0.25
-    ppr_alpha: float = 0.85
-    ppr_top_sessions: int = 10
-    ppr_top_seed_phrases: int = 10
-    ppr_top_triples: int = 20
-    enable_llm_triple_filter: bool = False
+
 
 @dataclass
 class QueryConfig:
