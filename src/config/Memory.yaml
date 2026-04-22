@@ -48,7 +48,7 @@ dialog:
 ################################# Graph #################################
 graph:
   graph_type: dynamic_memory
-  force: False
+  force: True
   add: False
   entity_merge_threshold: 0.85
   relationship_merge_threshold: 1
@@ -58,7 +58,7 @@ retriever:
   top_k_triples: 15
   top_chunks: 15
   enable_summary: True
-  top_summary: 3
+  top_summary: 2
   enable_visual: True
   top_visual: 15
   enable_full: True
