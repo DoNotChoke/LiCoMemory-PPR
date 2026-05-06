@@ -23,7 +23,6 @@ Question: {question}
 
 Context:
 - Session Summaries: {summaries}
-- Triples: {triples}
 - Text Chunks: {chunks}
 
 -Instructions-

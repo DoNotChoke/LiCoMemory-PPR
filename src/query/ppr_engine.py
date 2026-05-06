@@ -1,7 +1,8 @@
 import networkx as nx
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set, Tuple
 from collections import defaultdict
 import time
+import re
 
 import numpy as np
 from datetime import datetime
@@ -9,14 +10,31 @@ from datetime import datetime
 from src.init.logger import logger
 from src.init.config import Config
 from src.base.embeddings import EmbeddingManager
+from src.base.llm import LLMManager
+from src.prompt.recognition_memory_prompt import RECOGNITION_MEMORY_PROMPT
 
 
 class PPREngine:
-    """Orchestrates PPR-enhanced retrieval over a CogniGraph."""
+    """Orchestrates PPR-enhanced retrieval over a CogniGraph.
 
-    def __init__(self, config: Config, embedding_manager: EmbeddingManager):
+    Design decisions in this version:
+    - PPR runs on a TIME-AGNOSTIC graph: relation/context/synonym edges all
+      use static weights, and session-seed personalization is also time-
+      agnostic (just fusion_score).
+    - Temporal decay is applied AT THE END as a multiplicative rerank factor
+      on top-K sessions and top-K triples. This matches LiCoMemory paper §3.2
+      where R(t) = S_sem × w(Δτ).
+    """
+
+    def __init__(
+        self,
+        config: Config,
+        embedding_manager: EmbeddingManager,
+        llm_manager: Optional[LLMManager] = None,
+    ):
         self.config = config
         self.embedding_manager = embedding_manager
+        self.llm = llm_manager
 
         # --- Channel A (summary) ---
         self.top_k_summary = 15
@@ -25,7 +43,7 @@ class PPREngine:
         self.top_k_triples_b = 20
 
         # --- Fusion ---
-        self.alpha = 0.5
+        self.alpha = 0.7
         self.K_final = 15
 
         self.synonym_threshold = 0.8
@@ -37,12 +55,56 @@ class PPREngine:
         self.ppr_epsilon = 0.2
         self.ppr_session_weight = 0.5
         self.ppr_max_phrase_seeds = 5
-        # Weibull temporal decay
-        self.ppr_rerank_k = 0.2
 
         # --- Post-PPR fusion (structural + semantic) ---
-        self.beta_ppr = 0.8
-        self.beta_sem = 0.2
+        self.beta_ppr = 1.0
+        self.beta_sem = 0.0
+
+        # --- Hub-degree penalty for triple scoring ---
+        # Penalizes triples where one or both endpoints are high-degree hub
+        # nodes (e.g. "User"). Without this, hub nodes accumulate PPR mass
+        # simply from topology, causing generic triples like
+        # (User, interested in, X) to dominate over specific triples.
+        #
+        # Formula: hub_penalty = 1.0 / log2(2 + max(degree_src, degree_tgt))
+        #   → degree=1:  penalty = 1/log2(3)  ≈ 0.63
+        #   → degree=5:  penalty = 1/log2(7)  ≈ 0.36
+        #   → degree=15: penalty = 1/log2(17) ≈ 0.24
+        #   → degree=30: penalty = 1/log2(32) = 0.20
+        #
+        # The log dampens the penalty so that moderate-degree nodes aren't
+        # overly penalised — only true hubs get significant reduction.
+        self.enable_hub_penalty = True
+
+        # --- Recognition Memory (HippoRAG 2 §3.4) ---
+        # DISABLED by default: on conversational memory graphs dominated by
+        # behavioral/interest triples, the LLM filter lacks direct evidence
+        # and misdirects phrase seeding. Enable only when graph contains
+        # sufficient factual triples (e.g. financial, temporal facts).
+        self.enable_recognition = False
+        self.recognition_input_k = 8
+        self.recognition_max_keep = 5
+        self.recognition_fallback_k = 5
+
+        # --- Key-Fact Passage Weight Enhancement (CatRAG §3.4) ---
+        # Uses top-K local triples by similarity score (NOT recognition
+        # filter output) to boost context edges. This avoids the dependency
+        # on Recognition Memory while still concentrating PPR mass toward
+        # sessions containing the most query-relevant triples.
+        self.keyfact_boost_beta = 2.0
+        self.keyfact_top_k = 5  # how many top-sim local triples drive the boost
+
+        # --- Final Temporal Rerank (LiCoMemory §3.2) ---
+        # Applied AFTER PPR on top-K sessions and top-K triples.
+        # This is the ONLY place temporal information enters the pipeline.
+        # Set enable_temporal_rerank=False to disable entirely (e.g. for
+        # temporally-insensitive query types like preference recall).
+        self.enable_temporal_rerank = True
+        # Weibull decay coefficient. Smaller tk = gentler decay.
+        self.temporal_rerank_tk = 0.2
+        # How many top sessions/triples enter the rerank stage.
+        self.rerank_top_k_sessions = 15
+        self.rerank_top_k_triples = 20
 
         logger.info(
             f"PPREngine initialised  |  K_summary={self.top_k_summary}  "
@@ -50,7 +112,12 @@ class PPREngine:
             f"α={self.alpha}  K_final={self.K_final}  "
             f"damping={self.ppr_damping}  ε={self.ppr_epsilon}  "
             f"w_rel={self.w_rel}  w_syn×={self.w_syn_factor}  "
-            f"w_ctx={self.w_ctx}"
+            f"w_ctx={self.w_ctx}  "
+            f"recognition={'ON' if self.enable_recognition else 'OFF'}"
+            f" (in={self.recognition_input_k}/keep={self.recognition_max_keep})  "
+            f"keyfact_β={self.keyfact_boost_beta}  "
+            f"temporal_rerank={'ON' if self.enable_temporal_rerank else 'OFF'}"
+            f" (tk={self.temporal_rerank_tk})"
         )
 
     # ------------------------------------------------------------------
@@ -195,6 +262,150 @@ class PPREngine:
             'session_scores': dict(session_scores),
             'all_session_triple_count': dict(session_triple_count),
         }
+
+    # ==================================================================
+    # Recognition Memory (HippoRAG 2 §3.4)
+    # ==================================================================
+    # Filter triples through an LLM "recognition" step. Called by
+    # run_context_aware_ppr() with triples extracted from the LOCAL graph
+    # so every verified triple is guaranteed to exist in the subgraph
+    # PPR will walk on.
+    # ==================================================================
+
+    async def recognition_memory_filter(
+        self,
+        question: str,
+        triples: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """LLM-based triple filter using RECOGNITION_MEMORY_PROMPT.
+
+        Input format to LLM (one triple per line):
+            ("src", "relation", "tgt")
+
+        Output format from LLM (same tuple format, only relevant ones):
+            ("src", "relation", "tgt")
+            ("src2", "relation2", "tgt2")
+
+        The parser extracts (src, relation, tgt) from each output line and
+        matches back to the original triple dicts by (src, relation, tgt)
+        normalised to lowercase. Falls back to top-`recognition_fallback_k`
+        of input on any failure.
+        """
+        if not self.enable_recognition or not self.llm:
+            return triples[: self.recognition_max_keep]
+
+        if not triples:
+            return []
+
+        candidates = triples[: self.recognition_input_k]
+
+        # ---- 1. Format facts as ("src", "relation", "tgt") lines ----
+        fact_lines = []
+        for t in candidates:
+            src = t.get("src", "").strip()
+            rel = t.get("relation", "").strip()
+            tgt = t.get("tgt", "").strip()
+            fact_lines.append(f'("{src}", "{rel}", "{tgt}")')
+
+        facts_str = "\n".join(fact_lines)
+
+        prompt = RECOGNITION_MEMORY_PROMPT.format(
+            question=question,
+            facts=facts_str,
+        )
+
+        # ---- 2. Call LLM ----
+        t0 = time.time()
+        try:
+            response = await self.llm.generate(
+                prompt, task=None, max_tokens=256, temperature=0.0,
+            )
+        except Exception as e:
+            logger.warning(f"Recognition Memory: LLM call failed ({e}), fallback")
+            return candidates[: self.recognition_fallback_k]
+
+        elapsed = time.time() - t0
+        logger.info(f"Recognition Memory LLM call: {elapsed:.3f}s")
+
+        if not response or not response.strip():
+            logger.warning("Recognition Memory: empty response, fallback")
+            return candidates[: self.recognition_fallback_k]
+
+        # ---- 3. Parse output: extract (src, relation, tgt) tuples ----
+        # Matches both:
+        #   ("src", "relation", "tgt")
+        #   ('src', 'relation', 'tgt')
+        # Strips surrounding whitespace and quotes from each field.
+        tuple_pattern = re.compile(
+            r'\(\s*["\']([^"\']+?)["\']\s*,\s*["\']([^"\']+?)["\']\s*,\s*["\']([^"\']+?)["\']\s*\)'
+        )
+        parsed_tuples: List[Tuple[str, str, str]] = []
+        for match in tuple_pattern.finditer(response):
+            src_out = match.group(1).strip().lower()
+            rel_out = match.group(2).strip().lower()
+            tgt_out = match.group(3).strip().lower()
+            parsed_tuples.append((src_out, rel_out, tgt_out))
+
+        if not parsed_tuples:
+            logger.warning(
+                f"Recognition Memory: no tuples parsed from response "
+                f"({response[:80]!r}), fallback"
+            )
+            return candidates[: self.recognition_fallback_k]
+
+        # ---- 4. Match parsed tuples back to candidate dicts ----
+        # Build a lookup: (src_lower, rel_lower, tgt_lower) → original dict
+        candidate_lookup: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        for t in candidates:
+            key = (
+                t.get("src", "").strip().lower(),
+                t.get("relation", "").strip().lower(),
+                t.get("tgt", "").strip().lower(),
+            )
+            candidate_lookup[key] = t
+
+        filtered: List[Dict[str, Any]] = []
+        seen_keys: set = set()
+        for parsed_key in parsed_tuples:
+            if parsed_key in seen_keys:
+                continue
+            seen_keys.add(parsed_key)
+
+            if parsed_key in candidate_lookup:
+                # Exact match
+                filtered.append(candidate_lookup[parsed_key])
+            else:
+                # Fuzzy fallback: LLM may have slightly reworded the triple.
+                # Try substring matching on (src, tgt) ignoring relation.
+                src_p, _, tgt_p = parsed_key
+                for ckey, cval in candidate_lookup.items():
+                    src_c, _, tgt_c = ckey
+                    if (src_p in src_c or src_c in src_p) and \
+                       (tgt_p in tgt_c or tgt_c in tgt_p):
+                        if ckey not in seen_keys:
+                            seen_keys.add(ckey)
+                            filtered.append(cval)
+                            break
+
+        # Cap to recognition_max_keep
+        filtered = filtered[: self.recognition_max_keep]
+
+        if filtered:
+            logger.info(
+                f"Recognition Memory: kept {len(filtered)}/{len(candidates)} triples"
+            )
+            for f in filtered:
+                logger.info(
+                    f"  ✓ ({f.get('src','')}, {f.get('relation','')}, {f.get('tgt','')})"
+                )
+        else:
+            # All parsed tuples were hallucinated (not in candidates) → fallback
+            logger.warning(
+                "Recognition Memory: no matches found in candidates, fallback"
+            )
+            filtered = candidates[: self.recognition_fallback_k]
+
+        return filtered
 
     # ------------------------------------------------------------------
     # Dual-channel fusion
@@ -448,14 +659,130 @@ class PPREngine:
         fusion_result: Dict[str, Any],
         channel_b_triples: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
+        """Run Personalized PageRank on the time-agnostic local graph.
+
+        Pipeline:
+        A. Collect relation triples from local graph (guaranteed present)
+        B. Select key triples (top-K by similarity, or Recognition Memory if enabled)
+        C. Key-Fact Passage Weight Enhancement (boost context edges in-place)
+        D. Build personalization vector (TIME-AGNOSTIC):
+           D1. Phrase seeds from key_triples
+           D2. Symbolic anchors from query_entities
+           D3. Session seeds = ppr_session_weight × fusion_score (no Weibull)
+        E. Run PPR on the graph
+        F. Score sessions and triples
+        G. Final temporal rerank on top-K sessions and top-K triples
+        """
         if local_graph.number_of_nodes() == 0:
             logger.warning("PPR: local graph is empty")
             return self._empty_ppr_result()
 
+        # ==============================================================
+        # Step A: Collect relation triples from LOCAL graph
+        # ==============================================================
+        local_triples: List[Dict[str, Any]] = []
+        chanb_sim: Dict[Tuple[str, str], float] = {}
+        for t in channel_b_triples:
+            key = (t.get("src", ""), t.get("tgt", ""))
+            chanb_sim[key] = t.get("similarity_score", 0.0)
+
+        for src, tgt, data in local_graph.edges(data=True):
+            if data.get("edge_type") != "relation":
+                continue
+            local_triples.append({
+                "src": src,
+                "tgt": tgt,
+                "relation": data.get("relation_name", ""),
+                "triple_text": f"{src} {data.get('relation_name', '')} {tgt}",
+                "session_id": data.get("session_id", ""),
+                "chunk_id": data.get("chunk_id", ""),
+                "chunk_ids": data.get("chunk_ids", []),
+                "timestamp": data.get("timestamp", ""),
+                "embedding": data.get("embedding"),
+                "similarity_score": chanb_sim.get((src, tgt), 0.0),
+            })
+
+        local_triples.sort(key=lambda t: t["similarity_score"], reverse=True)
+        logger.info(
+            f"Local graph has {len(local_triples)} relation triples "
+            f"for Recognition Memory"
+        )
+
+        # ==============================================================
+        # Step B: Select key triples for seeding and Key-Fact boost
+        # ==============================================================
+        # Two paths depending on whether Recognition Memory is enabled:
+        #  - OFF (default): use top-K local triples by similarity score
+        #  - ON: use LLM-filtered triples (may hurt on behavioral graphs)
+        # The selected triples drive BOTH phrase seeding (Step D1) and
+        # Key-Fact context-edge boosting (Step C).
+        # ==============================================================
+        if self.enable_recognition:
+            key_triples = await self.recognition_memory_filter(
+                question=question,
+                triples=local_triples,
+            )
+            logger.info(
+                f"Key triples: {len(key_triples)} from Recognition Memory"
+            )
+        else:
+            key_triples = local_triples[: self.keyfact_top_k]
+            logger.info(
+                f"Key triples: top-{self.keyfact_top_k} by similarity "
+                f"(Recognition Memory OFF)"
+            )
+            if key_triples:
+                for kt in key_triples[:3]:
+                    logger.info(
+                        f"  → ({kt.get('src','')}, {kt.get('relation','')}, "
+                        f"{kt.get('tgt','')})  sim={kt.get('similarity_score', 0):.3f}"
+                    )
+
+        # ==============================================================
+        # Step C: Key-Fact Passage Weight Enhancement (in-place on graph)
+        # Boost context edges for (entity, session) pairs that appear in
+        # key_triples. This concentrates PPR mass toward sessions with
+        # the most query-relevant triples.
+        # ==============================================================
+        keyfact_pairs: Set[Tuple[str, str]] = set()
+        if key_triples and self.keyfact_boost_beta > 0:
+            for vt in key_triples:
+                v_sid = vt.get("session_id", "")
+                if not v_sid:
+                    continue
+                sess_node = f"sess:{v_sid}"
+                if not local_graph.has_node(sess_node):
+                    continue
+                for entity in (vt.get("src", ""), vt.get("tgt", "")):
+                    if not entity or not local_graph.has_node(entity):
+                        continue
+                    keyfact_pairs.add((entity, v_sid))
+
+            boost_count = 0
+            for entity_name, sid in keyfact_pairs:
+                sess_node = f"sess:{sid}"
+                for u, v in [(sess_node, entity_name), (entity_name, sess_node)]:
+                    if local_graph.has_edge(u, v):
+                        edata = local_graph.edges[u, v]
+                        if edata.get("edge_type") == "context":
+                            old_w = edata["weight"]
+                            edata["weight"] = old_w * (1.0 + self.keyfact_boost_beta)
+                            boost_count += 1
+
+            logger.info(
+                f"Key-Fact: boosted {boost_count} context edges "
+                f"from {len(keyfact_pairs)} (entity, session) pairs  "
+                f"(β={self.keyfact_boost_beta})"
+            )
+
+        # ==============================================================
+        # Step D: Build personalization vector (TIME-AGNOSTIC)
+        # ==============================================================
         personalization: Dict[str, float] = {}
 
+        # ---- D1. Phrase seeds from key_triples ----
         phrase_scores: Dict[str, float] = defaultdict(float)
-        for triple in channel_b_triples:
+        for triple in key_triples:
             for key in ("src", "tgt"):
                 name = triple.get(key, "")
                 if name and local_graph.has_node(name):
@@ -471,12 +798,13 @@ class PPREngine:
             personalization[name] = score
 
         logger.info(
-            f"PPR seeds — phrases: {len(sorted_phrases)}  "
+            f"PPR seeds — phrases ({len(sorted_phrases)} from "
+            f"{len(key_triples)} key triples):  "
             + ', '.join(f'{n}={s:.3f}' for n, s in sorted_phrases[:3])
         )
 
+        # ---- D2. Symbolic anchors (unchanged — safety net) ----
         anchors_added = 0
-
         for entity in query_entities:
             entity_clean = entity.strip()
             if entity_clean in local_graph.nodes:
@@ -508,27 +836,13 @@ class PPREngine:
 
         logger.info(f"PPR seeds - symbolic anchors: {anchors_added}")
 
-        # ---- 3. Session seeds (all session nodes, temporal-modulated) ----
-        # Build a fusion_score lookup from the fusion result
+        # ---- D3. Session seeds (TIME-AGNOSTIC: no Weibull here) ----
+        # Each session node gets a reset probability proportional to its
+        # fusion score from the dual-channel selection. We deliberately
+        # do NOT modulate by time gap — that's done at the rerank stage.
         fusion_lookup: Dict[str, float] = {}
         for sess in fusion_result.get("selected_sessions", []):
             fusion_lookup[sess["session_id"]] = sess.get("fusion_score", 0.0)
-
-        session_time_gaps: Dict[str, float] = {}
-        for node, data in local_graph.nodes(data=True):
-            if data.get("node_type") != "session":
-                continue
-            sid = data.get("session_id", "")
-            latest_ts = self._get_session_latest_timestamp(
-                local_graph, node
-            )
-            gap = (self._time_gap_days(question_time, latest_ts)
-                   if question_time and latest_ts else 0.0)
-            session_time_gaps[node] = gap
-
-        gaps = list(session_time_gaps.values())
-        median_gap = float(np.median(gaps)) if gaps else 1.0
-        median_gap = max(median_gap, 1.0)
 
         sessions_added = 0
         for node, data in local_graph.nodes(data=True):
@@ -536,22 +850,12 @@ class PPREngine:
                 continue
             sid = data.get("session_id", "")
             fusion_score = fusion_lookup.get(sid, 0.0)
-
-            delta = session_time_gaps.get(node, 0.0)
-            if delta >= 0 and self.ppr_rerank_k > 0:
-                w_t = np.exp(-((delta / median_gap) ** self.ppr_rerank_k))
-            else:
-                w_t = 1.0
-
-            session_reset = self.ppr_session_weight * fusion_score * w_t
+            session_reset = self.ppr_session_weight * fusion_score
             if session_reset > 0:
                 personalization[node] = session_reset
                 sessions_added += 1
 
-        logger.info(
-            f"PPR seeds — sessions: {sessions_added}  "
-            f"(median_gap={median_gap:.1f}d, tk={self.ppr_rerank_k})"
-        )
+        logger.info(f"PPR seeds — sessions: {sessions_added} (time-agnostic)")
 
         if not personalization:
             logger.warning(
@@ -564,11 +868,7 @@ class PPREngine:
         if not personalization:
             return self._empty_ppr_result()
 
-        # ---- 5. Normalize personalization ----
-        # Without normalization, phrase seeds (~0.7-0.85) drown out
-        # session seeds (~0.02-0.05).  We normalize to sum=1 so that
-        # the *relative* proportions are preserved but no group
-        # completely dominates.
+        # ---- Normalize personalization to sum=1 ----
         total_p = sum(personalization.values())
         if total_p > 0:
             personalization = {k: v / total_p for k, v in personalization.items()}
@@ -578,7 +878,9 @@ class PPREngine:
             f"top 5: {self._top_n_dict(personalization, 5)}"
         )
 
-        # ---- 6. Run PPR ----
+        # ==============================================================
+        # Step E: Run PPR
+        # ==============================================================
         t0 = time.time()
         try:
             ppr_scores = nx.pagerank(
@@ -603,7 +905,11 @@ class PPREngine:
         elapsed = time.time() - t0
         logger.info(f"PPR converged in {elapsed:.4f}s")
 
-        # ---- 6. Extract session scores ----
+        # ==============================================================
+        # Step F: Extract session and triple scores
+        # ==============================================================
+
+        # ---- F1. Session scores ----
         session_results: List[Dict[str, Any]] = []
         for node, data in local_graph.nodes(data=True):
             if data.get("node_type") != "session":
@@ -623,7 +929,7 @@ class PPREngine:
             )
         )
 
-        # ---- 7. Extract triple scores (harmonic mean) ----
+        # ---- F2. Triple scores (harmonic + semantic + hub penalty) ----
         triple_results: List[Dict[str, Any]] = []
         seen_triples = set()
         triple_embeddings_for_sim: list = []
@@ -645,6 +951,18 @@ class PPREngine:
             else:
                 harmonic = 0.0
 
+            # Hub-degree penalty: demote triples where an endpoint is a
+            # high-degree hub (e.g. "User" connected to 30+ nodes).
+            # This redistributes rank from generic triples toward specific
+            # ones that carry more informational value.
+            hub_penalty = 1.0
+            if self.enable_hub_penalty and harmonic > 0:
+                degree_src = local_graph.degree(src)
+                degree_tgt = local_graph.degree(tgt)
+                max_degree = max(degree_src, degree_tgt)
+                hub_penalty = 1.0 / np.log2(2 + max_degree)
+                harmonic = harmonic * hub_penalty
+
             triple_text = f"{src} {data.get('relation_name', '')} {tgt}"
             idx = len(triple_results)
 
@@ -654,14 +972,19 @@ class PPREngine:
                 'relation': data.get('relation_name', ''),
                 'triple_text': triple_text,
                 'ppr_score': harmonic,
+                'ppr_score_raw': (2.0 * s_src * s_tgt / (s_src + s_tgt)
+                                  if s_src + s_tgt > 0 else 0.0),
+                'hub_penalty': hub_penalty,
                 'src_ppr': s_src,
                 'tgt_ppr': s_tgt,
+                'src_degree': local_graph.degree(src),
+                'tgt_degree': local_graph.degree(tgt),
                 'session_id': data.get('session_id', ''),
                 'chunk_id': data.get('chunk_id', ''),
                 'chunk_ids': data.get('chunk_ids', []),
                 'timestamp': data.get('timestamp', ''),
-                'similarity_score': 0.0,  # will be filled in step 8
-                'final_score': harmonic,  # default; overwritten after rerank
+                'similarity_score': 0.0,
+                'final_score': harmonic,
             })
 
             emb = data.get('embedding')
@@ -703,7 +1026,6 @@ class PPREngine:
             }
             norm_ppr = self._min_max_normalize(ppr_harmonic_scores)
 
-            # 8d. Compute final fused score
             for i, triple in enumerate(triple_results):
                 ppr_norm = norm_ppr.get(i, 0.0)
                 sem = triple['similarity_score']
@@ -715,21 +1037,159 @@ class PPREngine:
         triple_results.sort(key=lambda x: x['final_score'], reverse=True)
 
         logger.info(
-            f"PPR+semantic triple ranking (top 5):  "
+            f"Pre-rerank triple ranking (top 5)"
+            + (f" [hub_penalty=ON]" if self.enable_hub_penalty else "") + ":  "
             + '  '.join(
                 f"{t['triple_text'][:30]} "
-                f"(ppr={t['ppr_score_norm']:.3f} "
+                f"(ppr={t.get('ppr_score_norm', 0):.3f} "
+                f"hub={t.get('hub_penalty', 1):.2f} "
                 f"sem={t['similarity_score']:.3f} "
                 f"final={t['final_score']:.3f})"
                 for t in triple_results[:5]
             )
         )
 
+        # ==============================================================
+        # Step G: Final Temporal Rerank (LiCoMemory §3.2)
+        # Apply Weibull decay only on top-K sessions and top-K triples.
+        # This is the ONLY place temporal information enters the pipeline.
+        # ==============================================================
+        ranked_sessions, ranked_triples = self._temporal_rerank(
+            session_results=session_results,
+            triple_results=triple_results,
+            local_graph=local_graph,
+            question_time=question_time,
+        )
+
         return {
             'ppr_scores': ppr_scores,
-            'ranked_sessions': session_results,
-            'ranked_triples': triple_results,
+            'ranked_sessions': ranked_sessions,
+            'ranked_triples': ranked_triples,
         }
+
+    # ==================================================================
+    # Final Temporal Rerank (LiCoMemory §3.2)
+    # ==================================================================
+    # Applies Weibull temporal decay to top-K sessions and top-K triples
+    # AFTER PPR. Multiplicative penalty on the structural/semantic score
+    # — does not change graph structure or PPR walk behavior.
+    #
+    # Formula (paper Eq. 3.2):
+    #     R(t) = S × w(Δτ)
+    #     w(Δτ) = exp(-(Δτ / τ̂)^tk),  0 < tk < 1
+    # where τ̂ is the median of Δτ across the rerank candidates.
+    # ==================================================================
+
+    def _temporal_rerank(
+        self,
+        session_results: List[Dict[str, Any]],
+        triple_results: List[Dict[str, Any]],
+        local_graph: nx.DiGraph,
+        question_time: str,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Apply Weibull temporal decay on top-K sessions and top-K triples.
+
+        Returns
+        -------
+        (ranked_sessions, ranked_triples) — both reordered after rerank.
+        Sessions/triples beyond top-K are appended unchanged at the end.
+        """
+        if not self.enable_temporal_rerank or not question_time:
+            logger.info("Temporal rerank: disabled or no question_time")
+            return session_results, triple_results
+
+        # ---- 1. Rerank sessions ----
+        top_k_sess = self.rerank_top_k_sessions
+        sess_top = session_results[:top_k_sess]
+        sess_rest = session_results[top_k_sess:]
+
+        # Compute time gaps for top-K sessions
+        sess_gaps: List[float] = []
+        for sess in sess_top:
+            node_name = sess["node_name"]
+            latest_ts = self._get_session_latest_timestamp(local_graph, node_name)
+            gap = (
+                self._time_gap_days(question_time, latest_ts)
+                if latest_ts else 0.0
+            )
+            sess["time_gap_days"] = gap
+            sess_gaps.append(gap)
+
+        # Median over top-K (not full list — locality of Weibull)
+        median_sess = float(np.median(sess_gaps)) if sess_gaps else 1.0
+        median_sess = max(median_sess, 1.0)
+
+        for sess in sess_top:
+            gap = sess["time_gap_days"]
+            if gap >= 0 and self.temporal_rerank_tk > 0:
+                w_t = float(np.exp(
+                    -((gap / median_sess) ** self.temporal_rerank_tk)
+                ))
+            else:
+                w_t = 1.0
+            sess["temporal_weight"] = w_t
+            sess["pre_rerank_score"] = sess["ppr_score"]
+            sess["rerank_score"] = sess["ppr_score"] * w_t
+
+        sess_top.sort(key=lambda s: s["rerank_score"], reverse=True)
+        ranked_sessions = sess_top + sess_rest
+
+        logger.info(
+            f"Temporal rerank — sessions (median_gap={median_sess:.1f}d, "
+            f"tk={self.temporal_rerank_tk}):  top 5: "
+            + '  '.join(
+                f"{s['session_id']} "
+                f"(ppr={s['pre_rerank_score']:.4f} "
+                f"w_t={s['temporal_weight']:.3f} "
+                f"→ {s['rerank_score']:.4f})"
+                for s in ranked_sessions[:5]
+            )
+        )
+
+        # ---- 2. Rerank triples ----
+        top_k_tri = self.rerank_top_k_triples
+        tri_top = triple_results[:top_k_tri]
+        tri_rest = triple_results[top_k_tri:]
+
+        tri_gaps: List[float] = []
+        for triple in tri_top:
+            ts = triple.get("timestamp", "")
+            gap = self._time_gap_days(question_time, ts) if ts else 0.0
+            triple["time_gap_days"] = gap
+            tri_gaps.append(gap)
+
+        median_tri = float(np.median(tri_gaps)) if tri_gaps else 1.0
+        median_tri = max(median_tri, 1.0)
+
+        for triple in tri_top:
+            gap = triple["time_gap_days"]
+            if gap >= 0 and self.temporal_rerank_tk > 0:
+                w_t = float(np.exp(
+                    -((gap / median_tri) ** self.temporal_rerank_tk)
+                ))
+            else:
+                w_t = 1.0
+            triple["temporal_weight"] = w_t
+            triple["pre_rerank_score"] = triple["final_score"]
+            triple["final_score"] = triple["pre_rerank_score"] * w_t
+
+        tri_top.sort(key=lambda t: t["final_score"], reverse=True)
+        ranked_triples = tri_top + tri_rest
+
+        logger.info(
+            f"Temporal rerank — triples (median_gap={median_tri:.1f}d):  "
+            f"top 5: "
+            + '  '.join(
+                f"{t['triple_text'][:25]} "
+                f"(pre={t['pre_rerank_score']:.3f} "
+                f"w_t={t['temporal_weight']:.3f} "
+                f"→ {t['final_score']:.3f})"
+                for t in ranked_triples[:5]
+            )
+        )
+
+        return ranked_sessions, ranked_triples
+
     # ------------------------------------------------------------------
     # Utilities
     # ------------------------------------------------------------------

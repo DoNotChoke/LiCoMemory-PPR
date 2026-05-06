@@ -219,6 +219,10 @@ class DynamicMemory:
             relationships = self.dialogue_extractor.deduplicate_relationships(
                 relationships, entity_mapping, self.config.graph.relationship_merge_threshold
             )
+            entities_path = os.path.join(self.base_dir, "entities.json")
+            relationships_path = os.path.join(self.base_dir, "relationships.json")
+            self.dialogue_extractor.save_entities(entities, entities_path)
+            self.dialogue_extractor.save_relationships(relationships, relationships_path)
 
             logger.info(f"Dialogue mode - After deduplication: {len(entities)} entities, {len(relationships)} relationships")
         else:
@@ -619,9 +623,6 @@ class DynamicMemory:
         summary_texts = []
         for summary in summaries:
             text_parts = []
-            session_id = summary.get("session_id", "unknown")
-            session_time = summary.get("session_time", "unknown")
-            text_parts.append(f"Session {session_id} ({session_time})")
 
             if 'keys' in summary and isinstance(summary['keys'], str):
                 text_parts.append(f"Keys: {summary['keys']}")

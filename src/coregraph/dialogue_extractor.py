@@ -1,5 +1,5 @@
 from typing import List, Dict, Any, Tuple
-import asyncio
+import re
 import json
 
 from src.init.logger import logger
@@ -19,180 +19,236 @@ class DialogueExtractor:
             logger.info("Dialogue Extractor initialized with LongmemEval prompt")
 
     async def extract_entities_and_relationships(self, text: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Extract both entities and relationships from dialogue text using the combined prompt."""
         if not text:
-            return [],[]
+            return [], []
 
         try:
-            prompt = self.extraction_prompt.format(text=text)
-            entities, relationships = await self.llm.generate(prompt, task="entities_relationships_extraction")
-            entities_parse = []
-            relationships_parse = []
-            for entity in entities:
-                entity_parse = self._parse_entity(entity)
-                if entity_parse:
-                    entities_parse.append(entity_parse)
+            mock_json = {
+                "session_time": "unknown",
+                "text": text,
+                "session_id": "unknown"
+            }
 
-            for relationship in relationships:
-                relationship_parse = self._parse_relationship(relationship)
-                if relationship_parse:
-                    relationships_parse.append(relationship_parse)
+            formatted_text = json.dumps(mock_json)
+            logger.debug(f"Converted plain text to JSON format for prompt: {formatted_text[:100]}")
+            prompt = self.extraction_prompt.format(text=formatted_text)
+            response = await self.llm.generate(prompt)
 
-            logger.debug(f"Extracted {len(entities_parse)} entities and {len(relationships_parse)} relationships from dialogue")
-            return entities_parse, relationships_parse
+            entities, relationships = self._parse_dialogue_response(response)
+            logger.debug(f"Extracted {len(entities)} entities and {len(relationships)} relationships from dialogue")
+            return entities, relationships
 
         except Exception as e:
             logger.error(f"Failed to extract entities and relationships from dialogue: {e}")
             logger.error(f"Input text that caused error: {text[:200]}")
-            return [],[]
+            return [], []
 
+    def _parse_dialogue_response(self, response: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Parse the LLM response to extract entities and relationships."""
+        entities = []
+        relationships = []
 
-    def _parse_entity(self, entity: Dict[str, Any]) -> Dict[str, Any]:
+        if not response:
+            return entities, relationships
+        parts = response.split('##')
+
+        for part in parts:
+            part = part.strip()
+            if not part or part == 'END':
+                continue
+
+            if part.startswith('("entity"|'):
+                entity = self._parse_entity(part)
+                if entity:
+                    entities.append(entity)
+            elif part.startswith('("relationship"|'):
+                relationship = self._parse_relationship(part)
+                if relationship:
+                    relationships.append(relationship)
+
+        return entities, relationships
+
+    def _parse_entity(self, entity_str: str) -> Dict[str, Any]:
+        """Parse entity string format: ("entity"|<entity_name>|<entity_type>)"""
         try:
-            if not isinstance(entity, dict):
-                return None
+            # Remove the outer parentheses and split by |
+            content = entity_str.strip('()')
+            parts = [part.strip('"') for part in content.split('|')]
 
-            entity_name = entity.get("entity_name", "")
-            entity_type = entity.get("entity_type", "")
-            description = entity.get("description", "")
-
-            if entity_name and entity_type:
+            if len(parts) >= 3 and parts[0] == 'entity':
                 return {
-                    "entity": entity_name,
-                    "type": entity_type,
-                    "description": description
+                    'entity': parts[1],
+                    'type': parts[2],
+                    'description': parts[3] if len(parts) > 3 else ''
                 }
         except Exception as e:
-            logger.warning(f"Failed to parse entity item: {entity}, error: {e}")
+            logger.warning(f"Failed to parse entity: {entity_str}, error: {e}")
 
         return None
 
-    def _parse_relationship(self, relationship: Dict[str, Any]) -> Dict[str, Any]:
+    def _parse_relationship(self, relationship_str: str) -> Dict[str, Any]:
+        """Parse relationship string format: ("relationship"|<create_time>|<session_id>|<source_entity>|<target_entity>|<relationship_name>|<relationship_strength>)"""
         try:
-            if not isinstance(relationship, dict):
-                return None
+            # Remove the outer parentheses and split by |
+            content = relationship_str.strip('()')
+            parts = [part.strip('"') for part in content.split('|')]
 
-            create_time = relationship.get("create_time", "")
-            session_id = relationship.get("session_id", "")
-            source_entity = relationship.get("source_entity", "")
-            target_entity = relationship.get("target_entity", "")
-            relationship_name = relationship.get("relationship_name", "")
-            relationship_strength = relationship.get("relationship_strength", 1)
-
-            try:
-                strength = int(relationship_strength)
-            except (TypeError, ValueError):
-                strength = 1
-
-            return {
-                "create_time": create_time,
-                "session_id": session_id,
-                "src": source_entity,
-                "tgt": target_entity,
-                "relation": relationship_name,
-                "strength": strength,
-                "weight": strength / 10.0,
-            }
+            if len(parts) >= 5 and parts[0] == 'relationship':
+                return {
+                    'src': parts[1],
+                    'tgt': parts[2],
+                    'relation': parts[3],
+                    'strength': int(parts[4]) if parts[4].isdigit() else 1,
+                    'weight': float(parts[4]) / 10.0 if parts[4].isdigit() else 0.1  # Convert strength to weight
+                }
         except Exception as e:
-            logger.warning(f"Failed to parse relationship item: {relationship}, error: {e}")
+            logger.warning(f"Failed to parse relationship: {relationship_str}, error: {e}")
 
         return None
 
-    async def extract_from_chunks(self, chunks: List[Dict[str, Any]], progress_bar=None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    async def extract_from_chunks(self, chunks: List[Dict[str, Any]], progress_bar=None) -> Tuple[
+        List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Extract entities and relationships from multiple dialogue chunks with concurrent support.
+
+        Args:
+            chunks: List of chunks to process
+            progress_bar: Optional tqdm progress bar to update as each request completes
+        """
         if not chunks:
-            return [],[]
+            return [], []
 
-        async def extract_one(chunk: Dict[str, Any], index: int):
-            try:
-                text = chunk.get("text", "")
-                session_time = str(chunk.get("session_time", "unknown"))
-                session_id = str(chunk.get("session_id", "unknown"))
+        if hasattr(self.llm, 'enable_concurrent') and self.llm.enable_concurrent:
+            prompts = []
+            chunk_metas = []
 
+            for chunk in chunks:
+                text = chunk.get('text', '')
+
+                # Get session metadata from chunk for better context
+                session_time = chunk.get('session_time', 'unknown')
+                session_id = chunk.get('session_id', 'unknown')
+
+                # Create JSON structure with session metadata (matching prompt format)
                 enhanced_json = {
                     "text": text,
-                    "session_time": session_time,
-                    "session_id": session_id,
+                    "session_time": str(session_time),
                 }
 
-                formatted_text = json.dumps(enhanced_json, ensure_ascii=False)
+                # Use the enhanced JSON format
+                formatted_text = json.dumps(enhanced_json)
+                prompt = self.extraction_prompt.format(text=formatted_text)
+                prompts.append(prompt)
+                chunk_metas.append(chunk)
 
-                entities, relationships = await self.extract_entities_and_relationships(
-                    formatted_text
-                )
-
-                # gắn thêm metadata từ chunk nếu cần
-                chunk_id = chunk.get("chunk_id")
-                doc_id = chunk.get("doc_id")
-
-                for entity in entities:
-                    if chunk_id is not None:
-                        entity["chunk_id"] = chunk_id
-                    if doc_id is not None:
-                        entity["doc_id"] = doc_id
-                    entity["session_id"] = session_id
-                    entity["session_time"] = session_time
-
-                for rel in relationships:
-                    if chunk_id is not None:
-                        rel["chunk_id"] = chunk_id
-                    if doc_id is not None:
-                        rel["doc_id"] = doc_id
-                    # ưu tiên metadata từ chunk nếu output LLM thiếu
-                    if not rel.get("session_id"):
-                        rel["session_id"] = session_id
-                    if not rel.get("create_time"):
-                        rel["create_time"] = session_time
-
-                return entities, relationships
-
+            try:
+                # Pass progress_bar to batch_generate so it updates as each request completes
+                responses = await self.llm.batch_generate(prompts, progress_bar=progress_bar)
             except Exception as e:
-                logger.error(f"Failed to extract from chunk {index}: {e}")
-                return [], []
-            finally:
+                logger.error(f"Failed to batch extract from chunks: {e}")
+                responses = ["" for _ in prompts]
+                # Update progress bar for failed requests
                 if progress_bar:
-                    progress_bar.update(1)
+                    progress_bar.update(len(prompts))
 
-        if hasattr(self.llm, "enable_concurrent") and self.llm.enable_concurrent:
-            results = await asyncio.gather(
-                *(extract_one(chunk, i) for i, chunk in enumerate(chunks)),
-                return_exceptions=False
-            )
+            all_entities = []
+            all_relationships = []
+
+            for i, (response, chunk) in enumerate(zip(responses, chunk_metas)):
+                try:
+                    chunk_entities, chunk_relationships = self._parse_dialogue_response(response)
+
+                    # Add chunk metadata to entities
+                    for entity in chunk_entities:
+                        entity['chunk_id'] = chunk.get('chunk_id', 0)
+                        entity['source_text'] = chunk.get('text', '')[:100] + '...' if len(
+                            chunk.get('text', '')) > 100 else chunk.get('text', '')
+
+                    # Add chunk metadata to relationships
+                    for relationship in chunk_relationships:
+                        relationship['session_id'] = chunk.get('session_id', 'unknown')
+                        relationship['create_time'] = chunk.get('session_time', 'unknown')
+                        relationship['chunk_id'] = chunk.get('chunk_id', 0)
+
+                    all_entities.extend(chunk_entities)
+                    all_relationships.extend(chunk_relationships)
+                except Exception as e:
+                    logger.error(f"Failed to parse response for chunk {i}: {e}")
+                    continue
         else:
-            results = []
-            for i, chunk in enumerate(chunks):
-                results.append(await extract_one(chunk, i))
+            all_entities = []
+            all_relationships = []
 
-        all_entities = []
-        all_relationships = []
+            for chunk in chunks:
+                text = chunk.get('text', '')
 
-        for entities, relationships in results:
-            all_entities.extend(entities)
-            all_relationships.extend(relationships)
+                session_time = chunk.get('session_time', 'unknown')
+                session_id = chunk.get('session_id', 'unknown')
+                enhanced_json = {
+                    "text": text,
+                    "session_time": str(session_time),
+                    "session_id": str(session_id)
+                }
+
+                formatted_text = json.dumps(enhanced_json)
+                try:
+                    prompt = self.extraction_prompt.format(text=formatted_text)
+                    response = await self.llm.generate(prompt)
+                    chunk_entities, chunk_relationships = self._parse_dialogue_response(response)
+                except Exception as e:
+                    logger.error(f"Failed to extract from chunk: {e}")
+                    chunk_entities, chunk_relationships = [], []
+                finally:
+                    if progress_bar:
+                        progress_bar.update(1)
+
+                # Add chunk metadata to entities
+                for entity in chunk_entities:
+                    entity['chunk_id'] = chunk.get('chunk_id', chunk.get('doc_id', 0))
+                    entity['source_text'] = text[:100] + '...' if len(text) > 100 else text
+                    entity['session_time'] = session_time
+                    entity['session_id'] = session_id
+
+                # Add chunk metadata to relationships
+                for relationship in chunk_relationships:
+                    relationship['chunk_id'] = chunk.get('chunk_id', chunk.get('doc_id', 0))
+                    relationship['source_text'] = text[:100] + '...' if len(text) > 100 else text
+                    # Preserve create_time from LLM extraction, fallback to session_time from chunk
+                    if 'create_time' not in relationship or not relationship['create_time']:
+                        relationship['create_time'] = session_time
+                    # Also set session_time for compatibility
+                    if 'session_time' not in relationship or not relationship['session_time']:
+                        relationship['session_time'] = relationship.get('create_time', session_time)
+                    # Set session_id if not already present
+                    if 'session_id' not in relationship or not relationship['session_id']:
+                        relationship['session_id'] = session_id
+
+                all_entities.extend(chunk_entities)
+                all_relationships.extend(chunk_relationships)
 
         logger.info(
-            f"Extracted total {len(all_entities)} entities and "
-            f"{len(all_relationships)} relationships from {len(chunks)} chunks"
-        )
-
+            f"Extracted {len(all_entities)} entities and {len(all_relationships)} relationships from {len(chunks)} dialogue chunks")
         return all_entities, all_relationships
 
-    def deduplicate_entities(self, entities: List[Dict[str, Any]], similarity_threshold: float = 0.85) -> Tuple[List[Dict[str, Any]], List[Dict[str, str]]]:
+    def deduplicate_entities(self, entities: List[Dict[str, Any]],
+                             similarity_threshold: float = 0.85) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
         if not entities:
-            return [], []
+            return [], {}
 
         unique_entities = []
         entity_mapping = {}
 
         for entity in entities:
-            entity_name = entity.get("entity", "")
+            entity_name = entity.get('entity', '')
             entity_name_lower = entity_name.lower()
-            entity_type = entity.get("type", "").lower()
+            entity_type = entity.get('type', '').lower()
             is_duplicate = False
             canonical_entity = None
 
             for unique_entity in unique_entities:
-                unique_name = unique_entity.get("entity", "")
+                unique_name = unique_entity.get('entity', '')
                 unique_name_lower = unique_name.lower()
-                unique_type = unique_entity.get("type", "").lower()
+                unique_type = unique_entity.get('type', '').lower()
                 if entity_name_lower == unique_name_lower and entity_type == unique_type:
                     is_duplicate = True
                     canonical_entity = unique_entity
@@ -207,16 +263,21 @@ class DialogueExtractor:
                     break
 
             if is_duplicate:
-                canonical_name = canonical_entity.get("entity", "")
-                entity_mapping[entity_name] = canonical_name
+                # Record the mapping from duplicate to canonical name
+                canonical_name = canonical_entity.get('entity', '')
+                entity_mapping[entity_name] = canonical_name  # Map original names
                 logger.debug(f"Entity mapping: '{entity_name}' -> '{canonical_name}'")
             else:
                 unique_entities.append(entity)
+                # Entity is its own canonical name
                 entity_mapping[entity_name] = entity_name
 
         return unique_entities, entity_mapping
 
-    def deduplicate_relationships(self, relationships: List[Dict[str, Any]], entity_mapping: Dict[str, str] = None, similarity_threshold: float = 0.9) -> List[Dict[str, Any]]:
+    def deduplicate_relationships(self, relationships: List[Dict[str, Any]],
+                                  entity_mapping: Dict[str, str] = None,
+                                  similarity_threshold: float = 0.9) -> List[Dict[str, Any]]:
+
         if not relationships:
             return []
         if entity_mapping:
@@ -225,19 +286,21 @@ class DialogueExtractor:
         unique_relationships = []
 
         for relationship in relationships:
-            src = relationship.get("src", "").lower()
-            tgt = relationship.get("tgt", "").lower()
-            relation = relationship.get("relation", "").lower()
+            src = relationship.get('src', '').lower()
+            tgt = relationship.get('tgt', '').lower()
+            relation = relationship.get('relation', '').lower()
             is_duplicate = False
 
             for unique_relationship in unique_relationships:
-                unique_src = unique_relationship.get("src", "").lower()
-                unique_tgt = unique_relationship.get("tgt", "").lower()
-                unique_relation = unique_relationship.get("relation", "").lower()
+                unique_src = unique_relationship.get('src', '').lower()
+                unique_tgt = unique_relationship.get('tgt', '').lower()
+                unique_relation = unique_relationship.get('relation', '').lower()
 
+                # Exact match
                 if src == unique_src and tgt == unique_tgt and relation == unique_relation:
                     is_duplicate = True
-                    self._merge_relationship_sessions(unique_relationship, entity_mapping)
+                    # Merge session information and update strength
+                    self._merge_relationship_sessions(unique_relationship, relationship)
                     break
 
             if not is_duplicate:
@@ -297,7 +360,7 @@ class DialogueExtractor:
                 existing_entity['chunk_ids'] = list(set(existing_chunks + [new_entity['chunk_id']]))
             else:
                 existing_entity['chunk_ids'] = [new_entity['chunk_id']]
-            existing_entity['chunk_id'] = new_entity['chunk_id']
+            existing_entity['chunk_id'] = new_entity['chunk_id']  # Keep latest
 
     def _merge_relationship_sessions(self, existing_relationship: Dict[str, Any], new_relationship: Dict[str, Any]):
         """Merge session information for duplicate relationships and update strength."""
@@ -334,7 +397,7 @@ class DialogueExtractor:
                 existing_relationship['chunk_ids'] = list(set(existing_chunks + [new_relationship['chunk_id']]))
             else:
                 existing_relationship['chunk_ids'] = [new_relationship['chunk_id']]
-            existing_relationship['chunk_id'] = new_relationship['chunk_id']
+            existing_relationship['chunk_id'] = new_relationship['chunk_id']  # Keep latest
 
     def _calculate_similarity(self, text1: str, text2: str) -> float:
         """Calculate simple similarity between two texts."""
@@ -351,3 +414,18 @@ class DialogueExtractor:
         """Check if two entity types are compatible for merging."""
         return type1 == type2
 
+    def save_entities(self, entities: List[Dict[str, Any]], output_path: str) -> None:
+        try:
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump(entities, f, ensure_ascii=False, indent=2)
+            logger.info(f"Saved {len(entities)} entities to {output_path}")
+        except Exception as e:
+            logger.error(f"Failed to save entities to {output_path}: {e}")
+
+    def save_relationships(self, relationships: List[Dict[str, Any]], output_path: str) -> None:
+        try:
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump(relationships, f, ensure_ascii=False, indent=2)
+            logger.info(f"Saved {len(relationships)} relationships to {output_path}")
+        except Exception as e:
+            logger.error(f"Failed to save relationships to {output_path}: {e}")

@@ -128,7 +128,7 @@ class LLMManager:
             logger.error(f"LLM API call failed: {e}")
             raise
 
-    async def batch_generate(self, prompts: List[str], progress_bar=None, task="", **kwargs) -> List[str]:
+    async def batch_generate(self, prompts: List[str], progress_bar=None, task=None, **kwargs) -> List[str]:
         if not self.enable_concurrent:
             logger.info("Concurrent not enabled, using sequential processing")
             results = []

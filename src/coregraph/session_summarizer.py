@@ -20,7 +20,6 @@ class SessionSummarizer:
             context = session_data.get("context", "")
 
             formatted_text = (
-                f"Session ID: {session_id}\n"
                 f"Session Time: {session_time}\n"
                 f"Context: {context}"
             )

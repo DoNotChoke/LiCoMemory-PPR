@@ -1,57 +1,42 @@
-SUMMARY_PROMPT = """You are a helpful assistant that summarizes a multi-turn chat transcript between a User and an Assistant.
+SUMMARY_PROMPT = """You are a memory management module for a long-term conversational agent. Your task is to produce a structured session summary for a conversation.
 
 - Goal -
-Produce a compact, factual, multi-theme summary of the conversation. Group content by distinct themes, and merge mentions of the same theme even if they appear across different turns.
-
+Produce a compact, factual, retrieval-optimized summary of a multi-turn conversation. The output serves as a session-level index node: it must surface key entities, temporal anchors, and thematic content that downstream retrieval can match against.
+You are given session time and the conversation, summary the core information.
 - Required Output Schema -
-Return an object that matches this structure exactly:
+Return a structured output with exactly these fields:
 
-"session_id" (string): Session ID of the input session.
-"session_time" (string): Session time of the input session.,
-"keys" ([string, ...]): List of key information string related to the conversation,
-"themes" (List of title and summary):  List of themes. Each theme contains a short title of a distinct conversation theme, and a concise factual summary of that theme.
+"keys" ([string, ...]): List of key retrieval anchors for this session.
+"themes" (list of {title, summary}): Thematic breakdown of the session.
 
 - Field Requirements -
-1. session_id
-- Copy the session id exactly from the input text.
 
-2. session_time
-- Copy the session time exactly from the input text.
+1. keys
+- Return a list of at most 6 short strings (1–4 words each).
+- Must include: session_time in reduced form (e.g. "2025/05", "2025/05/04"), named entities (people, places, products, organizations), and dominant topics.
+- Keys are used as retrieval anchors — prefer specific, distinctive terms over generic ones.
+- Avoid duplicates. Avoid vague terms like "conversation" or "discussion".
 
-3. keys
-- Return a list of at most 5 short strings.
-- These should capture the most important identifying or personalized information from the session.
-- Keys may include personal information, dates, locations, occupations, preferences, recurring topics, or other salient facts.
-- A reduced form of session_time MUST be included as one of the keys.
-- Keep each key short and specific.
-- Do not duplicate keys.
-
-4. themes
-- Return a list of distinct conversation themes.
+2. themes
+- Return a list of distinct thematic units from the session.
 - Each theme must contain:
-  - title: a short title for the theme.
-  - summary: a concise factual summary of that theme.
-- In each summary, prioritize:
-  - the user's preferences, needs, questions, constraints, and personalized details
-  - then the assistant's recommendations, explanations, or answers that appeared in the transcript
-- Only include information explicitly supported by the transcript.
-- Each summary should be concise, ideally 1-3 sentences.
+  - title (string): Short, specific label (3–6 words).
+  - summary (string): 1–3 sentence factual summary. Lead with user intent, constraints, or stated facts. Then include agent responses only if they add retrievable value (specific recommendations, named items, decisions made).
+- Merge content that belongs to the same topic even if spread across turns.
+- Do not duplicate information across themes.
 
 - Style Rules -
-1. Focus more on the user's preferences and personalized information than on generic assistant content.
-2. Write concisely. The total output should be roughly 150-220 words when possible.
-3. Use neutral third-person style, such as “The user…” and “The assistant…”.
-4. Be strictly factual. Do not hallucinate, infer unsupported details, or use outside knowledge.
-5. Do not include any text outside the JSON object.
-6. Do not rename fields.
-7. Do not return null unless absolutely necessary; prefer empty lists when no items are available.
+1. Prioritize user-stated facts, preferences, constraints, and personal details over agent-generated content.
+2. Every claim must be grounded in the transcript. No inference, no outside knowledge.
+3. Entity mentions in summaries should match the entities list exactly (same spelling/form).
+4. Use neutral third-person: "The user…", "The assistant…".
+5. Total output should be 180–280 words.
 
 ######################
 Example
 ######################
 
 Input Text:
-session_id: sharegpt_yywfIrx_0
 session_time: 2025/05/04
 
 User: I usually listen to podcasts on my commute to work. I am a software engineer.
@@ -63,10 +48,9 @@ Assistant: The Tim Ferriss Show and How I Built This could be good entrepreneurs
 User: I also listen to The Daily every morning.
 Assistant: The assistant acknowledged that The Daily is a strong news podcast and noted its storytelling format.
 
+
 Output:
-  "session_id": "sharegpt_yywfIrx_0",
-  "session_time": "2025/05/04",
-  "keys": ["2025/05", "software engineer", "podcasts", "commute", "The Daily"],
+  "keys": ["2025/05/04", "software engineer", "podcasts", "commute", "The Daily"],
   "themes": [
     {
       "title": "Podcast listening habits",
@@ -83,6 +67,7 @@ Output:
   ]
 
 
+
 ######################
 Real Input Text
 ######################
@@ -90,114 +75,99 @@ Real Input Text
 {text}
 """
 
-ADDITION_PROMPT = """You are a helpful assistant that updates an existing structured summary of a multi-turn chat transcript between a User and an Assistant.
+
+ADDITION_PROMPT = """You are a memory management module for a long-term conversational agent. Your task is to incrementally update an existing structured session summary given a new dialogue chunk.
 
 - Goal -
-Given:
-1. an existing structured summary, and
-2. a new dialogue chunk,
-
-update the summary so that it remains compact, factual, and organized by distinct themes.
-
-You should:
-- preserve existing information that is still valid,
-- integrate new information into existing themes whenever possible,
-- add new keys only if they are important and not already present,
-- add new themes only if the new dialogue introduces a distinct topic not already covered.
+Merge new information into the existing summary while preserving compactness and retrieval quality. The updated summary must remain accurate, deduplicated, and well-organized for downstream retrieval and entity-relation triple extraction.
 
 - Required Output Schema -
-Return an object that matches this structure exactly:
+Return a JSON object with exactly these fields:
 
-"session_id" (string): Session ID of the input session.
-"session_time" (string): Session time of the input session.,
-"keys" ([string, ...]): List of key information string related to the conversation,
-"themes" (List of title and summary):  List of themes. Each theme contains a short title of a distinct conversation theme, and a concise factual summary of that theme.
-
-- Field Requirements -
-1. session_id
-- Copy exactly from the existing summary.
-
-2. session_time
-- Copy exactly from the existing summary.
-
-3. keys
-- Return an updated list of up to 5 short strings.
-- Keep existing keys unless there is a strong reason to replace them.
-- Add a new key only if the new dialogue contains important identifying or personalized information not already represented.
-- Keys may include personal information, dates, locations, occupations, preferences, recurring topics, or other salient facts.
-- A reduced form of session_time should remain included as one of the keys.
-- Keep keys short, specific, and non-duplicated.
-
-4. themes
-- Return an updated list of distinct conversation themes.
-- Try to integrate the new dialogue into existing themes whenever possible.
-- Only add a new theme if the new dialogue introduces a clearly distinct topic not covered by the existing themes.
-- Each theme must contain:
-  - title: a short title for the theme
-  - summary: a concise factual summary of that theme
-- In each summary, prioritize:
-  - the user's preferences, needs, questions, constraints, and personalized details
-  - then the assistant's recommendations, explanations, or answers from the transcript
-- Only include information explicitly supported by the existing summary or the new dialogue chunk.
+"session_id" (string): Copied from existing summary.
+"session_time" (string): Copied from existing summary.
+"keys" ([string, ...]): Updated retrieval anchor list.
+"themes" (list of {title, summary, entities}): Updated thematic breakdown.
 
 - Update Rules -
-1. Preserve the overall structure and keep the summary compact.
-2. Merge repeated mentions of the same topic into one theme instead of creating duplicates.
-3. If the new dialogue adds no meaningful new information, you may return the existing summary unchanged.
-4. Do not invent, infer, or import outside knowledge.
-5. Use neutral third-person style, such as “The user…” and “The assistant…”.
-6. Do not include any text outside the JSON object.
-7. Do not rename fields.
-8. Do not return null unless absolutely necessary; prefer empty lists when no items are available.
+
+1. session_id / session_time
+- Copy exactly from the existing summary. Never modify.
+
+2. keys
+- Retain all existing keys unless directly contradicted.
+- Add new keys only if the new dialogue introduces important named entities or topics not yet represented.
+- Cap at 6 keys. Drop the least distinctive key if needed to stay within limit.
+- Prefer specific, retrievable terms (named entities, dates, locations) over generic ones.
+
+3. themes
+- First attempt to integrate new content into existing themes.
+- Only create a new theme if the new dialogue introduces a clearly distinct topic not covered.
+- For each updated theme: revise the summary to include new facts, and update the entities list.
+- If the new dialogue adds no meaningful new information, return the existing summary unchanged.
+- Never duplicate content across themes.
+
+4. Conflict & update handling
+- If the new dialogue contradicts an existing fact (e.g., user corrects a previous statement), update the relevant summary to reflect the most recent version.
+- Mark time-sensitive updates by including the relevant date/time in the summary sentence (e.g., "As of [date], the user…").
+
+- Style Rules -
+1. Lead summaries with user-stated facts and preferences; include agent content only when it adds retrievable value.
+2. All claims must be grounded in the existing summary or the new dialogue. No inference.
+3. Entity strings in the entities list must match their usage in the summary exactly.
+4. Use neutral third-person style.
+5. Return only the JSON object. No preamble, no markdown fences.
 
 ######################
 Example
 ######################
 
 Existing Summary:
-
+{
   "session_id": "sharegpt_yywfIrx_0",
   "session_time": "2025/05/04",
-  "keys": "May 4th, Podcast, January 25th, Software Engineer",
-  "context": {
-    "theme_1": "Entrepreneurship podcasts",
-    "summary_1": "The user expressed interest in listening to podcasts related to entrepreneurship (besides How I Built This). The assistant recommended over a dozen podcasts, such as Tim Ferriss Show, Entrepreneur on Fire, GaryVee Audio Experience, etc.",
-    "theme_2": "Tim Ferriss and Naval Ravikant",
-    "summary_2": "The user specifically mentioned listening to the episode of Tim Ferriss Show featuring Naval Ravikant. The assistant summarized Naval's views on self-awareness, meditation, entrepreneurial mindset, and wealth creation, citing several of his memorable quotes.",
-  }
-
-
-
-Dialogue Chunk:
-User: I have also been fascinated about Steve Jobs since I finished a podcast of his biography. Can you tell me more about him?
-Assistant: Sure thing! Steve Jobs was the co-founder, chairman, and CEO of Apple Inc. He was also the co-founder and CEO of Pixar Animation Studios when he was 30 years old. He was known for his innovative designs and his vision for the future.
-
-
-Updated Summary:
-
-  "session_id": "sharegpt_yywfIrx_0",
-  "session_time": "2025/05/04",
-  "keys": ["2025/05", "software engineer", "podcasts", "The Daily", "Steve Jobs"],
+  "keys": ["2025/05", "software engineer", "podcasts", "Tim Ferriss", "Naval Ravikant"],
   "themes": [
     {
-      "title": "Podcast listening during work",
-      "summary": "The user shared an interest in listening to podcasts while working as a software engineer. The assistant suggested a range of podcast options tailored to that interest."
-    },
-    {
       "title": "Entrepreneurship podcast recommendations",
-      "summary": "The user showed interest in entrepreneurship podcasts. The assistant recommended more than a dozen shows, including The Tim Ferriss Show and Entrepreneur on Fire."
+      "summary": "The user asked for entrepreneurship podcast suggestions. The assistant recommended The Tim Ferriss Show, Entrepreneur on Fire, and GaryVee Audio Experience.",
+      "entities": ["Tim Ferriss Show", "Entrepreneur on Fire", "GaryVee Audio Experience"]
     },
     {
-      "title": "News podcast preference",
-      "summary": "The user mentioned listening to The Daily every day and referred to an episode about the COVID-19 vaccine rollout. The assistant acknowledged the podcast’s strong reporting and storytelling style."
-    },
-    {
-      "title": "Interest in Steve Jobs",
-      "summary": "After finishing a podcast biography about Steve Jobs, the user expressed further interest in him. The assistant provided additional background information about Steve Jobs and his life."
+      "title": "Naval Ravikant episode interest",
+      "summary": "The user mentioned listening to the Tim Ferriss episode featuring Naval Ravikant. The assistant summarized Naval's perspectives on wealth, meditation, and entrepreneurship.",
+      "entities": ["Tim Ferriss", "Naval Ravikant"]
     }
   ]
+}
 
+Dialogue Chunk:
+User: I've also been fascinated by Steve Jobs since I finished a podcast about his biography. Can you tell me more?
+Assistant: Steve Jobs was the co-founder and CEO of Apple Inc. and co-founder of Pixar. He was known for his focus on design and long-term product vision.
 
+Updated Summary:
+{
+  "session_id": "sharegpt_yywfIrx_0",
+  "session_time": "2025/05/04",
+  "keys": ["2025/05", "software engineer", "podcasts", "Tim Ferriss", "Naval Ravikant", "Steve Jobs"],
+  "themes": [
+    {
+      "title": "Entrepreneurship podcast recommendations",
+      "summary": "The user asked for entrepreneurship podcast suggestions. The assistant recommended The Tim Ferriss Show, Entrepreneur on Fire, and GaryVee Audio Experience.",
+      "entities": ["Tim Ferriss Show", "Entrepreneur on Fire", "GaryVee Audio Experience"]
+    },
+    {
+      "title": "Naval Ravikant episode interest",
+      "summary": "The user mentioned listening to the Tim Ferriss episode featuring Naval Ravikant. The assistant summarized Naval's perspectives on wealth, meditation, and entrepreneurship.",
+      "entities": ["Tim Ferriss", "Naval Ravikant"]
+    },
+    {
+      "title": "Interest in Steve Jobs biography",
+      "summary": "After finishing a podcast biography of Steve Jobs, the user expressed interest in learning more. The assistant provided background on Jobs as co-founder of Apple and Pixar and his focus on design.",
+      "entities": ["Steve Jobs", "Apple", "Pixar"]
+    }
+  ]
+}
 
 ######################
 Real Input Text
