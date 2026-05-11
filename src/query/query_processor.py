@@ -1,6 +1,7 @@
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional, Set
 import os
 import time
+from collections import defaultdict
 
 from src.query.query_to_triple import QueryToTriple
 from src.init.logger import logger
@@ -189,7 +190,14 @@ class QueryProcessor:
         # Step 8: Retrieve dialogue chunks for top triples
         # ================================================================
         self.time_manager.start_chunk_retrieval()
-        relevant_chunks = await self._get_chunks_for_triples(ranked_triples)
+        # Pass selected session IDs so chunk retrieval can:
+        # (1) filter out chunks from unselected sessions
+        # (2) apply per-session chunk cap to enforce diversity
+        selected_session_ids = set(selected_ids)
+        relevant_chunks = await self._get_chunks_for_triples(
+            ranked_triples,
+            selected_session_ids=selected_session_ids,
+        )
         self.time_manager.end_chunk_retrieval()
 
         # ================================================================
@@ -199,8 +207,6 @@ class QueryProcessor:
             question, top_triples, relevant_chunks, relevant_summaries,
             question_time=question_time,
         )
-
-        print(formatted_prompt)
 
         cost_after_retrieval = self.llm.cost_manager.get_costs()
         retrieval_prompt_tokens = cost_after_retrieval.total_prompt_tokens - cost_before_retrieval.total_prompt_tokens
@@ -628,51 +634,143 @@ class QueryProcessor:
             logger.info(f"  {i + 1}. {triple['triple_text']} (score: {triple['final_score']:.3f})")
         return selected_triples
 
-    async def _get_chunks_for_triples(self, triples: List[Dict[str, Any]]) -> List[str]:
-        chunks = []
-        seen_chunk_ids = set()
+    async def _get_chunks_for_triples(
+        self,
+        triples: List[Dict[str, Any]],
+        selected_session_ids: Optional[Set[str]] = None,
+    ) -> List[str]:
+        """Retrieve dialogue chunks for top-ranked triples.
 
-        top_chunks = getattr(self.config.retriever, "top_chunks", 3) if hasattr(self.config, "retriever") else 3
+        Improvements over the original:
+        1. **Session filter**: Skip chunks whose triple belongs to a session
+           that was NOT selected by the dual-channel fusion. This prevents
+           noise chunks from unrelated sessions from filling the context.
+        2. **Per-session cap**: Limit the number of chunks contributed by
+           any single session to `max_chunks_per_session`. This enforces
+           diversity across sessions — a session with many high-scoring
+           triples cannot monopolise all chunk slots, leaving room for
+           evidence from other sessions.
 
-        logger.debug(f"Starting chunk retrival for {len(triples)} triples, target: {top_chunks} chunks")
+        Parameters
+        ----------
+        triples : list[dict]
+            Ranked triples (descending final_score) from PPREngine.
+        selected_session_ids : set[str] | None
+            Session IDs selected by dual-channel fusion. When provided,
+            chunks whose triple.session_id is NOT in this set are skipped.
+            Pass None to disable session filtering (legacy behaviour).
+        """
+        chunks: List[str] = []
+        seen_chunk_ids: set = set()
+
+        top_chunks = (
+            getattr(self.config.retriever, "top_chunks", 3)
+            if hasattr(self.config, "retriever") else 3
+        )
+
+        # Per-session cap: read from config if available, else default to 3.
+        # Setting max_chunks_per_session=top_chunks effectively disables cap.
+        max_per_session: int = (
+            getattr(self.config.retriever, "max_chunks_per_session", 3)
+            if hasattr(self.config, "retriever") else 3
+        )
+
+        # Track how many chunks each session has contributed
+        chunks_per_session: Dict[str, int] = defaultdict(int)
+
+        logger.debug(
+            f"Chunk retrieval: target={top_chunks}  "
+            f"max_per_session={max_per_session}  "
+            f"session_filter={'ON' if selected_session_ids else 'OFF'}  "
+            f"triples={len(triples)}"
+        )
 
         for triple_idx, triple in enumerate(triples):
             if len(chunks) >= top_chunks:
-                logger.debug(f"Reached target of {top_chunks} chunks, stopping at triple {triple_idx}")
+                logger.debug(
+                    f"Reached target of {top_chunks} chunks, "
+                    f"stopping at triple {triple_idx}"
+                )
                 break
 
-            all_chunk_ids = []
-            if "chunk_ids" in triple and triple["chunk_ids"]:
-                all_chunk_ids.extend(triple["chunk_ids"])
+            triple_session = triple.get("session_id", "")
 
+            # ---- Filter: skip triples from unselected sessions ----
+            if selected_session_ids is not None and triple_session:
+                if triple_session not in selected_session_ids:
+                    logger.debug(
+                        f"  Triple {triple_idx} skipped: session "
+                        f"'{triple_session}' not in selected sessions"
+                    )
+                    continue
+
+            # ---- Per-session cap ----
+            if chunks_per_session[triple_session] >= max_per_session:
+                logger.debug(
+                    f"  Triple {triple_idx} skipped: session "
+                    f"'{triple_session}' already at cap "
+                    f"({max_per_session})"
+                )
+                continue
+
+            # ---- Collect chunk IDs for this triple ----
+            all_chunk_ids: List[str] = []
+            if triple.get("chunk_ids"):
+                all_chunk_ids.extend(triple["chunk_ids"])
             current_chunk_id = triple.get("chunk_id", "")
             if current_chunk_id and current_chunk_id not in all_chunk_ids:
                 all_chunk_ids.append(current_chunk_id)
 
             if not all_chunk_ids:
-                logger.debug(f"Triple {triple_idx} has no chunk_ids, skipping")
+                logger.debug(
+                    f"Triple {triple_idx} has no chunk_ids, skipping"
+                )
                 continue
 
-            retrieved_for_this_triple = 0
-
+            # ---- Retrieve chunks ----
             for chunk_id in all_chunk_ids:
                 if len(chunks) >= top_chunks:
                     break
+                if chunks_per_session[triple_session] >= max_per_session:
+                    break
 
                 chunk_id_str = str(chunk_id)
-
                 if chunk_id_str in seen_chunk_ids:
-                    logger.debug(f"  Chunk {chunk_id} already retrieved, skipping")
+                    logger.debug(
+                        f"  Chunk {chunk_id} already retrieved, skipping"
+                    )
                     continue
 
                 chunk_content = await self._get_chunk_content(chunk_id)
                 if chunk_content:
                     chunks.append(chunk_content)
                     seen_chunk_ids.add(chunk_id_str)
-                    retrieved_for_this_triple += 1
-                    logger.debug( f"  ✓ Retrieved chunk {chunk_id} ({len(chunks)}/{top_chunks}) for triple: {triple.get('triple_text', '')[:50]}...")
+                    chunks_per_session[triple_session] += 1
+                    logger.debug(
+                        f"  ✓ Chunk {chunk_id} "
+                        f"[session={triple_session}, "
+                        f"sess_count={chunks_per_session[triple_session]}/"
+                        f"{max_per_session}, "
+                        f"total={len(chunks)}/{top_chunks}] "
+                        f"← {triple.get('triple_text', '')[:50]}"
+                    )
                 else:
                     logger.debug(f"  ✗ Failed to retrieve chunk {chunk_id}")
+
+        # ---- Summary log ----
+        logger.info(
+            f"Chunk retrieval complete: {len(chunks)}/{top_chunks} chunks  |  "
+            f"distribution: "
+            + ", ".join(
+                f"{sid[:20]}={cnt}"
+                for sid, cnt in sorted(
+                    chunks_per_session.items(),
+                    key=lambda x: x[1],
+                    reverse=True,
+                )
+                if cnt > 0
+            )
+        )
 
         return chunks
 
